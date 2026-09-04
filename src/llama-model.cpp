@@ -1295,6 +1295,16 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
 
     ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT_KV, hparams.n_head_kv_arr, hparams.n_layer_all, false);
 
+    // the NextN/MTP layers are structurally trunk blocks: mirror the last trunk
+    // layer's attention geometry so per-layer dims beyond n_layer() are non-zero
+    if (hparams.n_layer_nextn > 0 && hparams.n_layer() > 0) {
+        for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
+            hparams.n_head_arr[il]     = hparams.n_head_arr[hparams.n_layer() - 1];
+            hparams.n_head_kv_arr[il]  = hparams.n_head_kv_arr[hparams.n_layer() - 1];
+            hparams.n_ff_arr[il]       = hparams.n_ff_arr[hparams.n_layer() - 1];
+        }
+    }
+
     bool rope_finetuned = false;
     ml.get_key(LLM_KV_ROPE_SCALING_FINETUNED, rope_finetuned, false);
     hparams.rope_finetuned = rope_finetuned;

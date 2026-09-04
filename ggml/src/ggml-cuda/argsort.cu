@@ -33,7 +33,7 @@ static __global__ void init_offsets(int * offsets, const int ncols, const int nr
 int argsort_f32_i32_cuda_cub_chunk_nrows(const size_t nb01, const int64_t nrows) {
     // perform argsort in chunks up to approximately this size (currently 64MB)
     // to avoid excessive temporary buffers memory usage
-    const int chunk_bytes = 1 << 26;
+    const int chunk_bytes = 1 << 23; // llmcmp: 8MB chunks, top_k temp 192MB->~24MB per QSA layer (CCCL2.5 fallback)
 
     // calculate how many rows will fit in one chunk (must be at least one)
     const int chunk_nrows = std::max((int) (chunk_bytes / nb01), 1);
