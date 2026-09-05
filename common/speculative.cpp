@@ -2544,7 +2544,7 @@ common_speculative_init_result::common_speculative_init_result(
 
         mparams.model_shared = model_tgt;
 
-        llama_model * model_dft = llama_model_load_from_file(params.model.path.c_str(), mparams);
+        llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams); // llmcmp: #28442 (was params.model.path = target loaded twice as draft)
         if (model_dft == NULL) {
             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
             return;
