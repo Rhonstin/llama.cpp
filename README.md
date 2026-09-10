@@ -14,6 +14,7 @@ speculative decoding, QSA sparse attention.
 | `main` | current llmcmp stack + the phase-prefill port |
 | `phase-prefill` | E06 prefill phase-memory transaction, see `PHASE-PREFILL-LLMCMP.md` |
 | `qwen4exp-pooled-key-cache` | upstream submission of the QSA pooled-key cache ([ggml-org/llama.cpp#28699](https://github.com/ggml-org/llama.cpp/pull/28699)) |
+| `cuda-radix-topk` | archived CUDA radix TOP_K fallback (closed upstream PR #28366), superseded by CUB DeviceTopK |
 | `master` | mirror of upstream |
 
 ## Work carried in this fork
