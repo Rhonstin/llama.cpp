@@ -24,6 +24,15 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
 
 GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
 
+// Exclusive phase transitions only. Run each stage across ALL participating backends
+// before advancing: synchronize, invalidate graphs, free scheduler backing, release pools.
+enum ggml_cuda_phase_reset_stage {
+    GGML_CUDA_PHASE_SYNCHRONIZE = 0,
+    GGML_CUDA_PHASE_INVALIDATE_GRAPHS = 1,
+    GGML_CUDA_PHASE_RELEASE_POOLS = 2,
+};
+GGML_BACKEND_API bool ggml_backend_cuda_phase_reset(ggml_backend_t backend, int stage);
+
 // device buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
 

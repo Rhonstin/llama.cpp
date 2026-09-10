@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-cuda.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -15,8 +16,14 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <array>
+#include <mutex>
+#include <set>
+#include <thread>
+#include <type_traits>
 #include <stdexcept>
 #include <string>
 
@@ -452,6 +459,12 @@ llama_context::llama_context(
             }
         }
 
+        {
+            const char * LLAMA_NO_PIPELINE_PARALLEL = getenv("LLAMA_NO_PIPELINE_PARALLEL");
+            if (LLAMA_NO_PIPELINE_PARALLEL && LLAMA_NO_PIPELINE_PARALLEL[0] && LLAMA_NO_PIPELINE_PARALLEL[0] != '0') {
+                pipeline_parallel = false;
+            }
+        }
         cparams.pipeline_parallel = pipeline_parallel;
 
         if (cparams.pipeline_parallel) {
@@ -708,6 +721,224 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+}
+
+bool llama_context::experimental_prefill_transition(
+        llama_context * tgt, llama_context * dft, uint32_t target_ubatch, bool begin) {
+    // This process-global cache experiment deliberately supports only one pair,
+    // driven by one server thread. It is not a general concurrent-context API.
+    static std::mutex mutex;
+    static llama_context * owner_tgt = nullptr;
+    static llama_context * owner_dft = nullptr;
+    static std::thread::id owner_thread;
+    static bool active = false;
+    static bool failed = false;
+    static uint32_t original_tgt = 0, original_dft = 0;
+    static bool original_pp_tgt = false, original_pp_dft = false;
+    std::unique_lock<std::mutex> lock(mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        LLAMA_LOG_ERROR("phase_prefill: concurrent transition rejected; process restart required\n");
+        return false;
+    }
+    auto fail = [&](const char * reason) {
+        failed = true;
+        if (tgt) { tgt->experimental_prefill_failed = true; }
+        if (dft) { dft->experimental_prefill_failed = true; }
+        LLAMA_LOG_ERROR("phase_prefill: %s; process restart required (no rollback/retry)\n", reason);
+        return false;
+    };
+    if (failed || !tgt || !dft || tgt == dft) {
+        return fail("invalid or failed pair");
+    }
+    if (owner_tgt && (owner_tgt != tgt || owner_dft != dft || owner_thread != std::this_thread::get_id())) {
+        return fail("only the original exclusive pair/thread is supported");
+    }
+    if (tgt->model.arch != LLM_ARCH_QWEN4EXP || dft->model.arch != LLM_ARCH_QWEN4EXP || &tgt->model == &dft->model) {
+        return fail("requires external Qwen4Exp target and draft models");
+    }
+    if (tgt->cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || dft->cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+        return fail("requires target DEFAULT and draft MTP context types");
+    }
+    if (tgt->cparams.ctx_other || (dft->cparams.ctx_other && dft->cparams.ctx_other != tgt)) {
+        return fail("unsupported ctx_other linkage between target and draft");
+    }
+    if (!tgt->memory || !dft->memory) {
+        return fail("requires initialized target and draft memory");
+    }
+    if (tgt->cparams.n_seq_max != 1 || dft->cparams.n_seq_max != 1) {
+        return fail("requires n_seq_max 1 on both contexts");
+    }
+    if (tgt->cparams.n_batch < 2048 || dft->cparams.n_batch < 2048) {
+        return fail("requires logical n_batch >= 2048 on both contexts");
+    }
+    if (tgt->cparams.pipeline_parallel || dft->cparams.pipeline_parallel) {
+        LLAMA_LOG_INFO("phase_prefill: pipeline parallelism is enabled (llmcmp 8-GPU layer split); proceeding\n");
+    }
+    if (!tgt->cparams.embeddings_nextn || tgt->cparams.embeddings_nextn_masked || !dft->cparams.embeddings_nextn) {
+        return fail("requires nextn embeddings on target (unmasked) and draft");
+    }
+    LLAMA_LOG_INFO("%s: pair ok (tgt_mem=%p dft_mem=%p same_mem=%d dft_ctx_other=%p tgt_batch=%u dft_batch=%u"
+            " tgt_ub=%u dft_ub=%u)\n", __func__, (const void *) tgt->memory.get(), (const void *) dft->memory.get(),
+            tgt->memory.get() == dft->memory.get(), (const void *) dft->cparams.ctx_other,
+            tgt->cparams.n_batch, dft->cparams.n_batch, tgt->cparams.n_ubatch, dft->cparams.n_ubatch);
+
+    using reset_fn = decltype(ggml_backend_cuda_phase_reset) *;
+    std::vector<std::pair<ggml_backend_t, reset_fn>> cuda_backends;
+    std::set<ggml_backend_dev_t> target_devices, draft_devices;
+    for (auto * ctx : {tgt, dft}) {
+        for (auto * backend : ctx->backend_ptrs) {
+            auto * device = ggml_backend_get_device(backend);
+            if (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                continue;
+            }
+            auto * reg = ggml_backend_dev_backend_reg(device);
+            auto fn = reinterpret_cast<reset_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_phase_reset"));
+            if (strcmp(ggml_backend_reg_name(reg), "CUDA") != 0 || !fn) {
+                return fail("unsupported backend or missing CUDA phase-reset extension");
+            }
+            cuda_backends.emplace_back(backend, fn);
+            (ctx == tgt ? target_devices : draft_devices).insert(device);
+        }
+    }
+    if (target_devices.empty() || draft_devices.empty()) {
+        return fail("requires at least one target CUDA device and a CUDA draft");
+    }
+    for (auto * device : draft_devices) {
+        if (!target_devices.count(device)) { return fail("draft device is outside the target pair"); }
+    }
+    if (begin) {
+        if (active || (target_ubatch != 512 && target_ubatch != 1024 && target_ubatch != 2048) ||
+                tgt->cparams.n_ubatch == 0 || dft->cparams.n_ubatch == 0 ||
+                tgt->cparams.n_ubatch != dft->cparams.n_ubatch ||
+                target_ubatch > tgt->cparams.n_ctx) {
+            return fail("begin requires an inactive pair with equal start ubatches and requested 512/1024/2048");
+        }
+        owner_tgt = tgt;
+        owner_dft = dft;
+        owner_thread = std::this_thread::get_id();
+        original_tgt = tgt->cparams.n_ubatch;
+        original_dft = dft->cparams.n_ubatch;
+        original_pp_tgt = tgt->cparams.pipeline_parallel;
+        original_pp_dft = dft->cparams.pipeline_parallel;
+        active = true;
+    } else if (!active) {
+        return fail("end requires an active transition");
+    }
+
+    try {
+        // Called outside decode under the exclusive server-pair contract. Finish
+        // every graph before quiesce can publish settled cache-table mappings;
+        // a preceding asynchronous draft graph may still be reading those tables.
+        tgt->synchronize();
+        dft->synchronize();
+        auto cuda_stage = [&](int stage) {
+            for (const auto & backend : cuda_backends) {
+                if (!backend.second(backend.first, stage)) { return false; }
+            }
+            return true;
+        };
+        if (!cuda_stage(GGML_CUDA_PHASE_SYNCHRONIZE)) { return fail("CUDA synchronization failed"); }
+
+        const char * verify_env = std::getenv("LLAMA_PHASE_PREFILL_VERIFY");
+        const bool verify_contents = verify_env && strcmp(verify_env, "1") == 0;
+        auto hash_bytes = [](uint64_t hash, const void * data, size_t size) {
+            auto * bytes = static_cast<const unsigned char *>(data);
+            for (size_t i = 0; i < size; ++i) { hash = (hash ^ bytes[i]) * UINT64_C(1099511628211); }
+            return hash;
+        };
+        struct invariant {
+            llama_pos pos_min, pos_max;
+            const void * output_buffer;
+            const void * memory;
+            const void * balloc;
+            std::array<const void *, 8> views;
+            std::array<size_t, 8> sizes;
+            uint64_t metadata_hash, contents_hash;
+            uint32_t n_outputs, n_batch;
+        };
+        auto snapshot = [&](llama_context * ctx) {
+            uint64_t metadata = UINT64_C(14695981039346656037);
+            auto add_vector = [&](const auto & v) {
+                metadata = hash_bytes(metadata, v.data(), v.size() * sizeof(typename std::decay_t<decltype(v)>::value_type));
+                const size_t size = v.size();
+                metadata = hash_bytes(metadata, &size, sizeof(size));
+            };
+            add_vector(ctx->output_ids);
+            for (const auto & swap : ctx->output_swaps) {
+                metadata = hash_bytes(metadata, &swap.i0, sizeof(swap.i0));
+                metadata = hash_bytes(metadata, &swap.i1, sizeof(swap.i1));
+            }
+            if (ctx->balloc) { add_vector(ctx->balloc->get_out_ids()); }
+            add_vector(ctx->sampling.logits_count);
+            add_vector(ctx->sampling.probs_count);
+            add_vector(ctx->sampling.candidates_count);
+            uint64_t contents = 0;
+            if (verify_contents && ctx->buf_output) {
+                contents = hash_bytes(UINT64_C(14695981039346656037),
+                        ggml_backend_buffer_get_base(ctx->buf_output.get()),
+                        ggml_backend_buffer_get_size(ctx->buf_output.get()));
+            }
+            return invariant {
+                llama_memory_seq_pos_min(ctx->memory.get(), 0), llama_memory_seq_pos_max(ctx->memory.get(), 0),
+                ctx->buf_output.get(), ctx->memory.get(), ctx->balloc.get(),
+                { ctx->logits.data, ctx->embd.data, ctx->embd_nextn.data, ctx->sampling.logits.data,
+                  ctx->sampling.sampled.data, ctx->sampling.probs.data, ctx->sampling.candidates.data,
+                  ctx->output_ids.data() },
+                { ctx->logits.size, ctx->embd.size, ctx->embd_nextn.size, ctx->sampling.logits.size,
+                  ctx->sampling.sampled.size, ctx->sampling.probs.size, ctx->sampling.candidates.size,
+                  ctx->output_ids.size() },
+                metadata, contents, ctx->n_outputs, ctx->cparams.n_batch,
+            };
+        };
+        const std::array<invariant, 2> before = { snapshot(tgt), snapshot(dft) };
+
+        if (!cuda_stage(GGML_CUDA_PHASE_INVALIDATE_GRAPHS)) { return fail("CUDA graph invalidation failed"); }
+        for (auto * ctx : {tgt, dft}) {
+            // Free galloc backing, not sched_reset/reserve (which retain the
+            // allocation high-water mark). Never touch output_reserve, balloc,
+            // sampling, memory or the caller's pending_h / verify_h carriers.
+            ctx->sched.reset();
+            ctx->gf_res_prev.reset();
+            ctx->gf_res_reserve.reset();
+            ctx->sched_need_reserve = true;
+        }
+        if (!cuda_stage(GGML_CUDA_PHASE_RELEASE_POOLS)) { return fail("CUDA scratch release failed"); }
+        if (!begin) {
+            tgt->cparams.pipeline_parallel = original_pp_tgt;
+            dft->cparams.pipeline_parallel = original_pp_dft;
+        }
+        tgt->cparams.n_ubatch = begin ? target_ubatch : original_tgt;
+        dft->cparams.n_ubatch = original_dft;
+        // Each freshly-created allocator reserves only this selected physical
+        // ubatch (plus its one-token graph), never the logical batch4096 graph.
+        tgt->sched_reserve();
+        dft->sched_reserve();
+        size_t index = 0;
+        for (auto * ctx : {tgt, dft}) {
+            const auto after = snapshot(ctx);
+            const auto & old = before[index++];
+            if (after.pos_min != old.pos_min || after.pos_max != old.pos_max ||
+                    after.output_buffer != old.output_buffer || after.memory != old.memory || after.balloc != old.balloc ||
+                    after.views != old.views || after.sizes != old.sizes || after.metadata_hash != old.metadata_hash ||
+                    after.contents_hash != old.contents_hash || after.n_outputs != old.n_outputs || after.n_batch != old.n_batch) {
+                return fail("sequence state or host output invariant changed during reserve");
+            }
+            LLAMA_LOG_INFO("phase_prefill: %s %s ubatch=%u batch=%u seq0=[%d,%d] outputs=%u metadata=%" PRIu64
+                    " host_hash=%" PRIu64 " verify=%d\n", begin ? "begin" : "end", ctx == tgt ? "target" : "draft",
+                    ctx->cparams.n_ubatch, ctx->cparams.n_batch, after.pos_min, after.pos_max,
+                    after.n_outputs, after.metadata_hash, after.contents_hash, verify_contents);
+            for (auto * backend : ctx->backend_ptrs) {
+                LLAMA_LOG_INFO("phase_prefill: %s %s compute_bytes=%zu\n", ctx == tgt ? "target" : "draft",
+                        ggml_backend_name(backend), ggml_backend_sched_get_buffer_size(ctx->sched.get(), backend));
+            }
+        }
+        if (!begin) { active = false; }
+        return true;
+    } catch (const std::exception & error) {
+        return fail(error.what());
+    } catch (...) {
+        return fail("unknown transition exception");
+    }
 }
 
 void llama_context::synchronize() {
@@ -1403,6 +1634,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
+    if (experimental_prefill_failed) { return -1; }
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -1641,6 +1873,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    if (experimental_prefill_failed) { return -1; }
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -3767,6 +4000,14 @@ uint32_t llama_n_batch(const llama_context * ctx) {
 
 uint32_t llama_n_ubatch(const llama_context * ctx) {
     return ctx->n_ubatch();
+}
+
+bool llama_experimental_prefill_begin(llama_context * ctx_tgt, llama_context * ctx_dft, uint32_t target_ubatch) {
+    return llama_context::experimental_prefill_transition(ctx_tgt, ctx_dft, target_ubatch, true);
+}
+
+bool llama_experimental_prefill_end(llama_context * ctx_tgt, llama_context * ctx_dft) {
+    return llama_context::experimental_prefill_transition(ctx_tgt, ctx_dft, 0, false);
 }
 
 uint32_t llama_n_seq_max(const llama_context * ctx) {

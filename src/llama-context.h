@@ -57,6 +57,9 @@ struct llama_context {
 
     void synchronize();
 
+    static bool experimental_prefill_transition(
+            llama_context * ctx_tgt, llama_context * ctx_dft, uint32_t target_ubatch, bool begin);
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
@@ -344,6 +347,7 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+    bool experimental_prefill_failed = false;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

@@ -572,6 +572,15 @@ extern "C" {
     LLAMA_API uint32_t llama_n_ctx_seq  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
+
+    // Experimental, exclusive single-sequence Flash-Next target/external-MTP pair only.
+    // Begin before the first pure prompt batch; end after final MTP catch-up and before sampling.
+    // Changes physical compute capacity only; logical n_batch and sequence state are retained.
+    // target_ubatch must be 512 (control) or 2048. Any false result requires process restart.
+    LLAMA_API bool llama_experimental_prefill_begin(
+            struct llama_context * ctx_tgt, struct llama_context * ctx_dft, uint32_t target_ubatch);
+    LLAMA_API bool llama_experimental_prefill_end(
+            struct llama_context * ctx_tgt, struct llama_context * ctx_dft);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
 

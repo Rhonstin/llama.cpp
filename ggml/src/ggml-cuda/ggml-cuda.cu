@@ -2544,6 +2544,98 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     GGML_UNUSED(backend);
 }
 
+static size_t ggml_cuda_pool_used_size(const ggml_cuda_pool * pool) {
+    if (const auto * leg = dynamic_cast<const ggml_cuda_pool_leg *>(pool)) {
+        size_t cached = 0;
+        for (const auto & buffer : leg->buffer_pool) {
+            cached += buffer.size;
+        }
+        GGML_ASSERT(cached <= leg->pool_size);
+        return leg->pool_size - cached;
+    }
+#if defined(GGML_USE_VMM)
+    if (const auto * vmm = dynamic_cast<const ggml_cuda_pool_vmm *>(pool)) {
+        return vmm->pool_used;
+    }
+#endif
+    return 0;
+}
+
+bool ggml_backend_cuda_phase_reset(ggml_backend_t backend, int stage) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(backend);
+    GGML_UNUSED(stage);
+    return false;
+#else
+    if (!backend || !ggml_backend_is_cuda(backend) || stage < GGML_CUDA_PHASE_SYNCHRONIZE ||
+            stage > GGML_CUDA_PHASE_RELEASE_POOLS) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    std::unique_lock<std::mutex> lock(ggml_cuda_lock);
+    if (ggml_cuda_lock_counter.load(std::memory_order_relaxed) != 0) {
+        GGML_LOG_ERROR("%s: concurrent CUDA capture is unsupported\n", __func__);
+        return false;
+    }
+
+    int saved_device = 0;
+    CUDA_CHECK(cudaGetDevice(&saved_device));
+    if (stage == GGML_CUDA_PHASE_SYNCHRONIZE) {
+        // The ordinary backend synchronize waits only the current stream. Split
+        // matmuls and concurrent graphs can have work on other devices/streams.
+        for (int device = 0; device < GGML_CUDA_MAX_DEVICES; ++device) {
+            for (int stream = 0; stream < GGML_CUDA_MAX_STREAMS; ++stream) {
+                if (ctx->streams[device][stream] != nullptr) {
+                    ggml_cuda_set_device(device);
+                    CUDA_CHECK(cudaStreamSynchronize(ctx->streams[device][stream]));
+                }
+            }
+        }
+    } else if (stage == GGML_CUDA_PHASE_INVALIDATE_GRAPHS) {
+        ggml_cuda_set_device(ctx->device);
+#ifdef USE_CUDA_GRAPH
+        ctx->cuda_graphs.clear(); // destroys graph execs before any referenced allocation
+        ctx->last_graph_eviction_sweep = 0;
+#endif
+        ctx->concurrent_stream_context.reset();
+    }
+
+    // No live host RAII allocation may retain a pointer into a destroyed pool.
+    for (int device = 0; device < GGML_CUDA_MAX_DEVICES; ++device) {
+        for (int stream = 0; stream < GGML_CUDA_MAX_STREAMS; ++stream) {
+            const auto & pool = ctx->pools[device][stream];
+            if (pool && ggml_cuda_pool_used_size(pool.get()) != 0) {
+                GGML_LOG_ERROR("%s: device %d stream %d still has live scratch allocations\n",
+                        __func__, device, stream);
+                CUDA_CHECK(cudaSetDevice(saved_device));
+                return false;
+            }
+        }
+    }
+    if (stage == GGML_CUDA_PHASE_RELEASE_POOLS) {
+#ifdef USE_CUDA_GRAPH
+        if (!ctx->cuda_graphs.empty()) {
+            CUDA_CHECK(cudaSetDevice(saved_device));
+            return false;
+        }
+#endif
+        for (int device = 0; device < GGML_CUDA_MAX_DEVICES; ++device) {
+            for (int stream = 0; stream < GGML_CUDA_MAX_STREAMS; ++stream) {
+                if (ctx->pools[device][stream]) {
+                    ggml_cuda_set_device(device);
+                    ctx->pools[device][stream].reset(); // unmaps VMM high-water backing
+                }
+            }
+        }
+        ctx->curr_stream_no = 0;
+        // Keep streams/cuBLAS handles and their fixed-size workspaces; these do
+        // not scale with ubatch. Model, KV and recurrent allocations are separate.
+    }
+    CUDA_CHECK(cudaSetDevice(saved_device));
+    return true;
+#endif
+}
+
 static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
     return ggml_is_empty(t) || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE ||
            t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
@@ -5691,6 +5783,9 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_phase_reset") == 0) {
+        return (void *)ggml_backend_cuda_phase_reset;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

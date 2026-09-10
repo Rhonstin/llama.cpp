@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -912,6 +913,78 @@ private:
 
     int n_empty_consecutive = 0;
 
+    uint32_t phase_prefill_ubatch = 0;
+    bool phase_prefill_active = false;
+    bool phase_prefill_in_flight = false;
+    bool phase_prefill_release_pending = false;
+    int phase_prefill_slot = -1;
+
+    void phase_prefill_end(const char * reason) {
+        if (!phase_prefill_active) {
+            return;
+        }
+        if (phase_prefill_in_flight) {
+            GGML_ABORT("phase prefill restore before speculative carrier consumption");
+        }
+        const int64_t started = ggml_time_us();
+        if (!llama_experimental_prefill_end(ctx_tgt, ctx_dft)) {
+            GGML_ABORT("phase prefill end failed; state is not recoverable");
+        }
+        SRV_INF("phase_prefill END slot=%d target_ubatch=%u reason=%s transition_us=%" PRId64 "\n",
+                phase_prefill_slot, phase_prefill_ubatch, reason, ggml_time_us() - started);
+        phase_prefill_active = false;
+        phase_prefill_release_pending = false;
+        phase_prefill_slot = -1;
+    }
+
+    void phase_prefill_cleanup_released() {
+        // Called only at serialized queue/update boundaries, after decode() returns.
+        if (phase_prefill_release_pending) {
+            phase_prefill_end("slot_release");
+        }
+    }
+
+    void phase_prefill_prepare(int32_t off, const llama_batch & view) {
+        if (phase_prefill_ubatch == 0) {
+            return;
+        }
+        if (slots.size() != 1 || batch.has_embd || view.n_tokens <= 0 ||
+                off < 0 || off + view.n_tokens > batch.size()) {
+            GGML_ABORT("phase prefill requires a nonempty single-slot text batch");
+        }
+        auto & slot = slots.front();
+        if (!slot.task || slot.task->type != SERVER_TASK_TYPE_COMPLETION ||
+                slot.task->params.n_cmpl != 1 || slot.task->is_parent() || slot.task->is_child()) {
+            GGML_ABORT("phase prefill received an incompatible task");
+        }
+        const bool is_prompt = batch.tokens.front().is_prompt;
+        for (const auto & token : batch.tokens) {
+            if (token.id_slot != slot.id || token.is_prompt != is_prompt) {
+                GGML_ABORT("phase prefill does not support mixed logical batches");
+            }
+        }
+        if (phase_prefill_active && phase_prefill_slot != slot.id) {
+            GGML_ABORT("phase prefill slot changed while active");
+        }
+        if (!is_prompt) {
+            phase_prefill_end("nonprompt_batch");
+            return;
+        }
+        if (slot.state != SLOT_STATE_PROCESSING_PROMPT && slot.state != SLOT_STATE_DONE_PROMPT) {
+            GGML_ABORT("phase prefill prompt metadata disagrees with slot state");
+        }
+        if (!phase_prefill_active && view.n_tokens > 8) {
+            const int64_t started = ggml_time_us();
+            if (!llama_experimental_prefill_begin(ctx_tgt, ctx_dft, phase_prefill_ubatch)) {
+                GGML_ABORT("phase prefill begin failed; state is not recoverable");
+            }
+            phase_prefill_active = true;
+            phase_prefill_slot = slot.id;
+            SRV_INF("phase_prefill BEGIN slot=%d target_ubatch=%u transition_us=%" PRId64 "\n",
+                    slot.id, phase_prefill_ubatch, ggml_time_us() - started);
+        }
+    }
+
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
     server_metrics metrics;
@@ -936,6 +1009,7 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        phase_prefill_end("destroy");
         spec.reset();
         spec_init.reset();
 
@@ -1021,6 +1095,29 @@ private:
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
+
+        phase_prefill_ubatch = 0;
+        if (const char * value = std::getenv("LLAMA_PHASE_PREFILL_UBATCH")) {
+            const std::string requested(value);
+            if (requested != "512" && requested != "1024" && requested != "2048") {
+                SRV_ERR("%s", "LLAMA_PHASE_PREFILL_UBATCH must be 512, 1024 or 2048\n");
+                return false;
+            }
+            phase_prefill_ubatch = (uint32_t) std::strtoul(requested.c_str(), nullptr, 10);
+            const auto & spec_types = params_base.speculative.types;
+            const bool phase_mtp_only =
+                std::count(spec_types.begin(), spec_types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) == 1 &&
+                std::all_of(spec_types.begin(), spec_types.end(), [](common_speculative_type type) {
+                    return type == COMMON_SPECULATIVE_TYPE_NONE || type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+                });
+            if (params_base.n_parallel != 1 || params_base.n_batch != 4096 ||
+                    has_mmproj || params_base.embedding || !phase_mtp_only ||
+                    (params_base.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED &&
+                     params_base.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
+                SRV_ERR("%s", "phase prefill requires one text-generation slot, batch4096 and MTP only\n");
+                return false;
+            }
+        }
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
@@ -1284,6 +1381,13 @@ private:
             return false;
         }
 
+        if (phase_prefill_ubatch != 0 && (!ctx_dft || !spec || mctx ||
+                llama_n_batch(ctx_tgt) < 2048 ||
+                llama_n_ubatch(ctx_tgt) != llama_n_ubatch(ctx_dft))) {
+            SRV_ERR("%s", "phase prefill requires initialized external MTP contexts with batch>=2048 and equal start ubatch\n");
+            return false;
+        }
+
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
 
@@ -1300,6 +1404,9 @@ private:
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
             slot.callback_on_release = [this](int id_slot) {
+                if (phase_prefill_active && phase_prefill_slot == id_slot) {
+                    phase_prefill_release_pending = true;
+                }
                 queue_tasks.pop_deferred_task(id_slot);
             };
 
@@ -2352,12 +2459,21 @@ private:
             return false;
         }
 
+        if (!is_yielding) {
+            phase_prefill_cleanup_released();
+        }
+
         switch (task.type) {
             case SERVER_TASK_TYPE_COMPLETION:
             case SERVER_TASK_TYPE_INFILL:
             case SERVER_TASK_TYPE_EMBEDDING:
             case SERVER_TASK_TYPE_RERANK:
                 {
+                    if (phase_prefill_ubatch != 0 && (task.type != SERVER_TASK_TYPE_COMPLETION ||
+                            task.params.n_cmpl != 1 || task.is_parent() || task.is_child())) {
+                        send_error(task, "phase prefill supports one text completion only", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
                     // special case: if input is provided via CLI, tokenize it first
                     // otherwise, no need to tokenize as it's already done inside the HTTP thread
                     if (task.cli) {
@@ -2764,6 +2880,7 @@ private:
 #endif
 
     void update_slots() {
+        phase_prefill_cleanup_released();
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -2789,6 +2906,7 @@ private:
             }
 
             if (all_idle) {
+                phase_prefill_end("all_idle");
                 SRV_TRC("%s", "all slots are idle\n");
 
                 metrics_flush_idle();
@@ -2863,6 +2981,9 @@ private:
                     continue;
                 }
             } catch (const std::exception & e) {
+                if (phase_prefill_active || phase_prefill_in_flight) {
+                    GGML_ABORT("phase prefill decode exception: %s", e.what());
+                }
                 SRV_ERR("decode() failed: %s\n", e.what());
                 abort_all_slots("decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
@@ -3623,6 +3744,7 @@ private:
         metrics_pre_decode();
 
         if (batch.size() == 0) {
+            phase_prefill_end("empty_batch");
             SRV_WRN("%s", "no tokens to decode\n");
 
             if (++n_empty_consecutive > 3) {
@@ -3648,6 +3770,9 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
+        phase_prefill_prepare(off, batch_view);
+        phase_prefill_in_flight = phase_prefill_active;
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
@@ -3659,6 +3784,9 @@ private:
         });
 
         if (ret != 0) {
+            if (phase_prefill_active) {
+                GGML_ABORT("phase prefill target decode failed: ret=%d", ret);
+            }
             {
                 std::string err;
 
@@ -3721,10 +3849,23 @@ private:
             });
 
             if (!ok) {
+                if (phase_prefill_active) {
+                    GGML_ABORT("phase prefill speculative processing failed");
+                }
                 SRV_ERR("%s", "failed to process speculative batch\n");
 
                 // TODO: handle error
                 throw std::runtime_error("failed to process speculative batch");
+            }
+        }
+
+        phase_prefill_in_flight = false;
+        if (phase_prefill_active) {
+            const auto & slot = slots.front();
+            // DONE_PROMPT may precede decode of the final logical-batch subview.
+            if (slot.state == SLOT_STATE_DONE_PROMPT &&
+                    slot.i_batch >= off && slot.i_batch < off + batch_view.n_tokens) {
+                phase_prefill_end("prompt_done");
             }
         }
 
